@@ -1,7 +1,7 @@
 /*
  * Jailhouse, a Linux-based partitioning hypervisor
  *
- * Copyright (c) Siemens AG, 2014
+ * Copyright (c) Siemens AG, 2014, 2015
  *
  * Authors:
  *  Ivan Kolchin <ivan.kolchin@siemens.com>
@@ -36,6 +36,7 @@ struct pci_cfg_control {
 		PCI_CONFIG_DENY,
 		PCI_CONFIG_ALLOW,
 		PCI_CONFIG_RDONLY,
+		PCI_CONFIG_BAR,
 	} type;   /* Access type */
 	u32 mask; /* Bit set: access type applies; bit cleared: deny access */
 };
@@ -45,6 +46,9 @@ struct pci_cfg_control {
 static const struct pci_cfg_control endpoint_write[PCI_CONFIG_HEADER_SIZE] = {
 	[0x04/4] = {PCI_CONFIG_ALLOW,  0xffffffff}, /* Command, Status */
 	[0x0c/4] = {PCI_CONFIG_ALLOW,  0xff00ffff}, /* BIST, Lat., Cacheline */
+	[0x10/4 ...                                 /* BAR0-BAR5 */
+	 0x24/4] = {PCI_CONFIG_BAR,    0xffffffff},
+	[0x30/4] = {PCI_CONFIG_RDONLY, 0xffffffff}, /* ROM BAR */
 	[0x3c/4] = {PCI_CONFIG_ALLOW,  0x000000ff}, /* Int Line */
 };
 
@@ -182,7 +186,7 @@ enum pci_access pci_cfg_read_moderate(struct pci_device *device, u16 address,
 				      unsigned int size, u32 *value)
 {
 	const struct jailhouse_pci_capability *cap;
-	unsigned int cap_offs;
+	unsigned int bar_no, cap_offs;
 
 	if (!device) {
 		*value = -1;
@@ -191,6 +195,21 @@ enum pci_access pci_cfg_read_moderate(struct pci_device *device, u16 address,
 
 	if (device->info->type == JAILHOUSE_PCI_TYPE_IVSHMEM)
 		return pci_ivshmem_cfg_read(device, address, size, value);
+
+	if (device->info->type == JAILHOUSE_PCI_TYPE_DEVICE) {
+		/* Emulate BAR access, always returning the shadow value. */
+		if (address >= PCI_CFG_BAR && address < PCI_CFG_CARDBUS) {
+			bar_no = (address - PCI_CFG_BAR) / 4;
+			*value = device->bar[bar_no] >> ((address % 4) * 8);
+			return PCI_ACCESS_DONE;
+		}
+
+		/* We do not expose ROMs. */
+		if (address >= PCI_CFG_ROMBAR && address < PCI_CFG_CAPS) {
+			*value = 0;
+			return PCI_ACCESS_DONE;
+		}
+	}
 
 	if (address < PCI_CONFIG_HEADER_SIZE)
 		return PCI_ACCESS_PERFORM;
@@ -244,13 +263,15 @@ enum pci_access pci_cfg_write_moderate(struct pci_device *device, u16 address,
 	unsigned int bias_shift = (address % 4) * 8;
 	u32 mask = BYTE_MASK(size) << bias_shift;
 	struct pci_cfg_control cfg_control;
-	unsigned int cap_offs;
+	unsigned int bar_no, cap_offs;
 
 	if (!device)
 		return PCI_ACCESS_REJECT;
 
 	if (device->info->type == JAILHOUSE_PCI_TYPE_IVSHMEM)
 		return pci_ivshmem_cfg_write(device, address, size, value);
+
+	value <<= bias_shift;
 
 	if (address < PCI_CONFIG_HEADER_SIZE) {
 		if (device->info->type == JAILHOUSE_PCI_TYPE_BRIDGE)
@@ -266,6 +287,12 @@ enum pci_access pci_cfg_write_moderate(struct pci_device *device, u16 address,
 			return PCI_ACCESS_PERFORM;
 		case PCI_CONFIG_RDONLY:
 			return PCI_ACCESS_DONE;
+		case PCI_CONFIG_BAR:
+			bar_no = (address - PCI_CFG_BAR) / 4;
+			device->bar[bar_no] &= ~mask;
+			device->bar[bar_no] |=
+				value & device->info->bar_mask[bar_no];
+			return PCI_ACCESS_DONE;
 		default:
 			return PCI_ACCESS_REJECT;
 		}
@@ -274,8 +301,6 @@ enum pci_access pci_cfg_write_moderate(struct pci_device *device, u16 address,
 	cap = pci_find_capability(device, address);
 	if (!cap || !(cap->flags & JAILHOUSE_PCICAPS_WRITE))
 		return PCI_ACCESS_REJECT;
-
-	value <<= bias_shift;
 
 	cap_offs = address - cap->start;
 	if (cap->id == PCI_CAP_MSI &&
@@ -548,11 +573,15 @@ static int pci_add_virtual_device(struct cell *cell, struct pci_device *device)
 
 static int pci_add_physical_device(struct cell *cell, struct pci_device *device)
 {
-	unsigned int size = device->info->msix_region_size;
+	unsigned int n, size = device->info->msix_region_size;
 	int err;
 
 	printk("Adding PCI device %02x:%02x.%x to cell \"%s\"\n",
 	       PCI_BDF_PARAMS(device->info->bdf), cell->config->name);
+
+	for (n = 0; n < PCI_NUM_BARS; n ++)
+		device->bar[n] = pci_read_config(device->info->bdf,
+						 PCI_CFG_BAR + n * 4, 4);
 
 	err = arch_pci_add_physical_device(cell, device);
 
